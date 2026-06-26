@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
 from sklearn.preprocessing import MinMaxScaler
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 from model import Model
 from utils import adj_to_edge_index, build_neighbor_dict, generate_rwr_subgraph, load_mat, normalize_adj, preprocess_features
@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--auc_test_rounds", type=int, default=256)
     parser.add_argument("--negsamp_ratio", type=int, default=1)
     parser.add_argument("--rwr_restart_prob", type=float, default=0.9)
-    parser.add_argument("--save_model_path", type=str, default="best_model.pkl")
+    parser.add_argument("--save_model_path", type=str, default="best_model.pt")
     parser.add_argument("--results_dir", type=str, default="results",
                         help="Directory for trial scores, trial metrics and checkpoints.")
     parser.add_argument("--summary_csv", type=str, default=None,
@@ -222,15 +222,8 @@ def load_and_preprocess(args, device):
     return adj, adj_raw, features, ano_label, degree_ave, nb_nodes, ft_size, neighbor_list
 
 
-def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str):
+def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_tune: bool=False):
     seed = trial
-    print("Dataset:", args.dataset)
-    print("Data dir:", os.path.expanduser(args.data_dir))
-    print("lr:", args.lr)
-    print("epoch:", args.num_epoch)
-    print("trial:", trial)
-    print("seed:", seed)
-    print("device:", device)
     set_seed(seed)
 
     adj, adj_raw, features, ano_label, degree_ave, nb_nodes, ft_size, neighbor_list = load_and_preprocess(args, device)
@@ -243,104 +236,94 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str):
     )
     batch_num = nb_nodes // args.batch_size + 1
     best = 1e9
-    best_t = 0
 
     # Train model
-    with tqdm(total=args.num_epoch, desc=f"Training trial {trial}") as pbar:
-        for epoch in range(args.num_epoch):
-            model.train()
-            all_idx = list(range(nb_nodes))
-            random.shuffle(all_idx)
-            total_loss = 0.0
-            last_loss = 0.0
-            last_batch_size = 0
+    for epoch in trange(args.num_epoch, desc=f"Epoch", position=1 if is_tune else 0, leave=not is_tune):
+        model.train()
+        all_idx = list(range(nb_nodes))
+        random.shuffle(all_idx)
+        total_loss = 0.0
+        last_loss = 0.0
+        last_batch_size = 0
 
-            subgraphs = generate_rwr_subgraph(
-                neighbor_list,
-                num_nodes=nb_nodes,
-                subgraph_size=args.subgraph_size,
-                restart_prob=args.rwr_restart_prob,
-            )
+        subgraphs = generate_rwr_subgraph(
+            neighbor_list,
+            num_nodes=nb_nodes,
+            subgraph_size=args.subgraph_size,
+            restart_prob=args.rwr_restart_prob,
+        )
 
-            for batch_idx in range(batch_num):
-                is_final_batch = batch_idx == (batch_num - 1)
-                if not is_final_batch:
-                    idx = all_idx[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size]
-                else:
-                    idx = all_idx[batch_idx * args.batch_size:]
-                if len(idx) == 0:
-                    continue
+        for batch_idx in range(batch_num):
+            is_final_batch = batch_idx == (batch_num - 1)
+            if not is_final_batch:
+                idx = all_idx[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size]
+            else:
+                idx = all_idx[batch_idx * args.batch_size:]
+            if len(idx) == 0:
+                continue
 
-                optimiser.zero_grad()
-                cur_batch_size = len(idx)
-                last_batch_size = cur_batch_size
-                lbl = torch.cat(
-                    (torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio))
-                ).unsqueeze(1).to(device)
+            optimiser.zero_grad()
+            cur_batch_size = len(idx)
+            last_batch_size = cur_batch_size
+            lbl = torch.cat(
+                (torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio))
+            ).unsqueeze(1).to(device)
 
-                ba, bf = make_batch_tensors(idx, subgraphs, adj, features, ft_size, args.subgraph_size, device)
-                logits, _ = model(bf, ba)
-                loss_all = b_xent(logits, lbl)
-                loss = torch.mean(loss_all)
-                loss.backward()
-                optimiser.step()
+            ba, bf = make_batch_tensors(idx, subgraphs, adj, features, ft_size, args.subgraph_size, device)
+            logits, _ = model(bf, ba)
+            loss_all = b_xent(logits, lbl)
+            loss = torch.mean(loss_all)
+            loss.backward()
+            optimiser.step()
 
-                last_loss = float(loss.detach().cpu())
-                if not is_final_batch:
-                    total_loss += last_loss
+            last_loss = float(loss.detach().cpu())
+            if not is_final_batch:
+                total_loss += last_loss
 
-            mean_loss = (total_loss * args.batch_size + last_loss * last_batch_size) / nb_nodes
-            if mean_loss < best:
-                best = mean_loss
-                best_t = epoch
-                torch.save(model.state_dict(), args.save_model_path)
-
-            pbar.set_postfix(loss=mean_loss)
-            pbar.update(1)
+        mean_loss = (total_loss * args.batch_size + last_loss * last_batch_size) / nb_nodes
+        if mean_loss < best:
+            best = mean_loss
+            torch.save(model.state_dict(), args.save_model_path)
 
     # Test model
-    print(f"Loading {best_t}th epoch")
     model.load_state_dict(torch.load(args.save_model_path, map_location=device))
     model.eval()
 
     multi_round_attr_ano_score = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float32)
     nodes_embed = torch.zeros([nb_nodes, args.embedding_dim], dtype=torch.float32, device=device)
 
-    with tqdm(total=args.auc_test_rounds, desc=f"Testing trial {trial}") as pbar_test:
-        for test_round in range(args.auc_test_rounds):
-            all_idx = list(range(nb_nodes))
-            random.shuffle(all_idx)
-            subgraphs = generate_rwr_subgraph(
-                neighbor_list,
-                num_nodes=nb_nodes,
-                subgraph_size=args.subgraph_size,
-                restart_prob=args.rwr_restart_prob,
-            )
+    for test_round in trange(args.auc_test_rounds, desc="Test", position=1 if is_tune else 0, leave=not is_tune):
+        all_idx = list(range(nb_nodes))
+        random.shuffle(all_idx)
+        subgraphs = generate_rwr_subgraph(
+            neighbor_list,
+            num_nodes=nb_nodes,
+            subgraph_size=args.subgraph_size,
+            restart_prob=args.rwr_restart_prob,
+        )
 
-            for batch_idx in range(batch_num):
-                is_final_batch = batch_idx == (batch_num - 1)
-                if not is_final_batch:
-                    idx = all_idx[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size]
-                else:
-                    idx = all_idx[batch_idx * args.batch_size:]
-                if len(idx) == 0:
-                    continue
+        for batch_idx in range(batch_num):
+            is_final_batch = batch_idx == (batch_num - 1)
+            if not is_final_batch:
+                idx = all_idx[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size]
+            else:
+                idx = all_idx[batch_idx * args.batch_size:]
+            if len(idx) == 0:
+                continue
 
-                cur_batch_size = len(idx)
-                ba, bf = make_batch_tensors(idx, subgraphs, adj, features, ft_size, args.subgraph_size, device)
+            cur_batch_size = len(idx)
+            ba, bf = make_batch_tensors(idx, subgraphs, adj, features, ft_size, args.subgraph_size, device)
 
-                with torch.no_grad():
-                    logits, batch_embed = model(bf, ba)
-                    logits = torch.sigmoid(torch.squeeze(logits))
-                    if test_round == args.auc_test_rounds - 1:
-                        nodes_embed[idx] = batch_embed
+            with torch.no_grad():
+                logits, batch_embed = model(bf, ba)
+                logits = torch.sigmoid(torch.squeeze(logits))
+                if test_round == args.auc_test_rounds - 1:
+                    nodes_embed[idx] = batch_embed
 
-                pos_logits = logits[:cur_batch_size]
-                neg_logits = logits[cur_batch_size:].view(args.negsamp_ratio, cur_batch_size).mean(dim=0)
-                attr_ano_score = -(pos_logits - neg_logits).detach().cpu().numpy()
-                multi_round_attr_ano_score[test_round, idx] = attr_ano_score
-
-            pbar_test.update(1)
+            pos_logits = logits[:cur_batch_size]
+            neg_logits = logits[cur_batch_size:].view(args.negsamp_ratio, cur_batch_size).mean(dim=0)
+            attr_ano_score = -(pos_logits - neg_logits).detach().cpu().numpy()
+            multi_round_attr_ano_score[test_round, idx] = attr_ano_score
 
     # Attribute anomaly scores
     attr_ano_score_final = np.mean(multi_round_attr_ano_score, axis=0)
@@ -397,23 +380,19 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str):
     final_scores_rate = max_alpha * attr_ano_score_final + (1 - max_alpha) * stru_ano_score_final
     best_auc, best_auprc = compute_auc_auprc(ano_label, final_scores_rate)
 
-    score_file = trial_score_path(results_dir, args.dataset, cfg_key, trial)
-    np.savez_compressed(
-        score_file,
-        y_true=np.asarray(ano_label).reshape(-1).astype(np.int64),
-        y_score=np.asarray(final_scores_rate).reshape(-1).astype(np.float32),
-        attr_score=np.asarray(attr_ano_score_final).reshape(-1).astype(np.float32),
-        stru_score=np.asarray(stru_ano_score_final).reshape(-1).astype(np.float32),
-        alpha=np.asarray(max_alpha, dtype=np.float32),
-        auc=np.asarray(best_auc, dtype=np.float32),
-        auprc=np.asarray(best_auprc, dtype=np.float32),
-    )
-
-    print("Alpha:", max_alpha)
-    print("AUC:{:.4f}".format(best_auc))
-    print("AUPRC:{:.4f}".format(best_auprc))
-    print("Score file:", score_file)
-    print()
+    score_file = "None"
+    if not is_tune:
+        score_file = trial_score_path(results_dir, args.dataset, cfg_key, trial)
+        np.savez_compressed(
+            score_file,
+            y_true=np.asarray(ano_label).reshape(-1).astype(np.int64),
+            y_score=np.asarray(final_scores_rate).reshape(-1).astype(np.float32),
+            attr_score=np.asarray(attr_ano_score_final).reshape(-1).astype(np.float32),
+            stru_score=np.asarray(stru_ano_score_final).reshape(-1).astype(np.float32),
+            alpha=np.asarray(max_alpha, dtype=np.float32),
+            auc=np.asarray(best_auc, dtype=np.float32),
+            auprc=np.asarray(best_auprc, dtype=np.float32),
+        )
 
     return {
         "trial": trial,

@@ -63,12 +63,15 @@ class WSReadout(nn.Module):
         super(WSReadout, self).__init__()
 
     def forward(self, seq, query):
-        query = query.permute(0,2,1)
-        sim = torch.matmul(seq,query)
-        sim = F.softmax(sim,dim=1)
-        sim = sim.repeat(1, 1, 64)
-        out = torch.mul(seq,sim)
-        out = torch.sum(out,1)
+        query = query.permute(0, 2, 1)
+        sim = torch.matmul(seq, query)
+        sim = F.softmax(sim, dim=1)
+        # The original implementation repeated the attention weights to 64,
+        # which breaks Optuna trials when embedding_dim is not 64.  Expanding
+        # to seq's shape keeps weighted_sum compatible with any hidden size.
+        sim = sim.expand_as(seq)
+        out = torch.mul(seq, sim)
+        out = torch.sum(out, 1)
         return out
 
 class Discriminator(nn.Module):
