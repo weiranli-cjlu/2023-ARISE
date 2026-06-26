@@ -2,3 +2,4 @@ __pycache__
 .venv
 best_model.pt
 optuna_results
+test.ipynb
