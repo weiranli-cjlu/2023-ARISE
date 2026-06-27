@@ -1,12 +1,16 @@
 import argparse
+import copy
 import csv
+import gc
 import hashlib
 import json
 import os
 import random
-import time
+from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import List, Sequence
 
 import networkx as nx
 import numpy as np
@@ -19,13 +23,40 @@ from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm, trange
 
 from model import Model
-from utils import adj_to_edge_index, build_neighbor_dict, generate_rwr_subgraph, load_mat, normalize_adj, preprocess_features
+from utils import (
+    adj_to_edge_index,
+    build_neighbor_dict,
+    build_weight_lookup,
+    generate_rwr_subgraph,
+    load_mat,
+    normalize_adj,
+    preprocess_features,
+)
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
+@dataclass
+class PreparedData:
+    """Data shared by all trials for one dataset.
+
+    The original script reloaded the .mat file, rebuilt neighbors and moved a
+    dense N*N adjacency matrix to GPU for every run/trial.  This object keeps
+    immutable dataset-level objects once and reuses them across runs.
+    """
+
+    adj_lookup: List[dict]
+    adj_raw: sp.csr_matrix
+    features_cpu: torch.Tensor
+    labels: np.ndarray
+    degree_ave: float
+    nb_nodes: int
+    ft_size: int
+    neighbor_list: List[List[int]]
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="ARISE without DGL; RWR is implemented with PyG-style edge_index + PyTorch.")
+    parser = argparse.ArgumentParser(description="ARISE low-memory PyTorch/PyG-style implementation.")
     parser.add_argument("--dataset", type=str, default="cora")
     parser.add_argument("--data_dir", type=str, default="~/datasets/GAD/mat",
                         help="Directory containing <dataset>.mat files. Default: ~/datasets/GAD/mat")
@@ -38,10 +69,17 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=300)
     parser.add_argument("--subgraph_size", type=int, default=4)
     parser.add_argument("--readout", type=str, default="avg", choices=["max", "min", "avg", "weighted_sum"])
-    parser.add_argument("--auc_test_rounds", type=int, default=256)
+    parser.add_argument("--auc_test_rounds", type=int, default=64,
+                        help="Number of stochastic test rounds. Use 256 for final paper-level evaluation if resources allow.")
     parser.add_argument("--negsamp_ratio", type=int, default=1)
     parser.add_argument("--rwr_restart_prob", type=float, default=0.9)
+    parser.add_argument("--subgraph_resample_interval", type=int, default=1,
+                        help="Regenerate RWR subgraphs every N epochs/test rounds. Larger values reduce CPU cost; 1 preserves old behavior.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Use CUDA automatic mixed precision to reduce GPU memory. Disabled by default for numerical stability.")
     parser.add_argument("--save_model_path", type=str, default="best_model.pt")
+    parser.add_argument("--save_best_model", action="store_true",
+                        help="Save the best model checkpoint to --save_model_path. By default the best state is kept in memory to reduce IO.")
     parser.add_argument("--results_dir", type=str, default="results",
                         help="Directory for trial scores, trial metrics and checkpoints.")
     parser.add_argument("--summary_csv", type=str, default=None,
@@ -59,38 +97,65 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
-    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-def make_batch_tensors(idx, subgraphs, adj, features, ft_size, subgraph_size, device):
+def _subgraphs_to_numpy(idx: Sequence[int], subgraphs) -> np.ndarray:
+    return np.asarray([subgraphs[i] for i in idx], dtype=np.int64)
+
+
+def make_batch_tensors(idx, subgraphs, adj_lookup, features_cpu, ft_size, subgraph_size, device):
+    """Build only the mini-batch subgraph tensors instead of storing dense N*N adjacency.
+
+    Final tensor layout intentionally matches the previous implementation:
+      - adjacency: original subgraph block + one zero row/column whose self-loop is 1
+      - feature: [neighbors, zero-vector, seed]
+    """
     cur_batch_size = len(idx)
-    # Vectorized extraction. This is much faster than looping over nodes with
-    # repeated advanced indexing on the dense global adjacency matrix.
-    sub_idx = torch.as_tensor([subgraphs[i] for i in idx], dtype=torch.long, device=device)
-    ba = adj[sub_idx.unsqueeze(2), sub_idx.unsqueeze(1)]
-    bf = features[sub_idx]
+    sub_idx_np = _subgraphs_to_numpy(idx, subgraphs)
 
-    added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size), device=device)
-    added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1), device=device)
-    added_adj_zero_col[:, -1, :] = 1.0
-    added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size), device=device)
+    # Build the small batched adjacency on CPU.  subgraph_size is usually 3-8,
+    # so dictionary lookup is far cheaper in memory than dense global adjacency.
+    ba_np = np.zeros((cur_batch_size, subgraph_size + 1, subgraph_size + 1), dtype=np.float32)
+    for b, nodes in enumerate(sub_idx_np):
+        for r, src in enumerate(nodes):
+            row_weights = adj_lookup[int(src)]
+            if not row_weights:
+                continue
+            for c, dst in enumerate(nodes):
+                value = row_weights.get(int(dst))
+                if value is not None:
+                    ba_np[b, r, c] = value
+    ba_np[:, -1, -1] = 1.0
 
-    ba = torch.cat((ba, added_adj_zero_row), dim=1)
-    ba = torch.cat((ba, added_adj_zero_col), dim=2)
-    bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]), dim=1)
+    flat_idx = torch.from_numpy(sub_idx_np.reshape(-1))
+    bf_src = features_cpu.index_select(0, flat_idx).view(cur_batch_size, subgraph_size, ft_size)
+    bf = torch.zeros((cur_batch_size, subgraph_size + 1, ft_size), dtype=features_cpu.dtype)
+    if subgraph_size > 1:
+        bf[:, :subgraph_size - 1, :] = bf_src[:, :-1, :]
+    bf[:, -1:, :] = bf_src[:, -1:, :]
+
+    ba = torch.from_numpy(ba_np).to(device=device, non_blocking=True)
+    bf = bf.to(device=device, non_blocking=True)
     return ba, bf
+
+
+def make_labels(cur_batch_size: int, negsamp_ratio: int, device):
+    lbl = torch.empty((cur_batch_size * (1 + negsamp_ratio), 1), dtype=torch.float32, device=device)
+    lbl[:cur_batch_size].fill_(1.0)
+    lbl[cur_batch_size:].zero_()
+    return lbl
 
 
 def iter_batches(indices, batch_size):
     """Yield batches while avoiding a final singleton batch.
 
-    The discriminator uses in-batch cyclic-shift negative sampling.  A batch of
+    The discriminator uses in-batch cyclic-shift negative sampling. A batch of
     one node cannot provide a real in-batch negative sample, so when the last
-    chunk has length 1 we merge it into the previous chunk.  This preserves all
-    nodes during both training and testing and prevents shape/pathological-loss
-    issues for datasets such as twitter with 4865 nodes and batch_size=256.
+    chunk has length 1 we merge it into the previous chunk.
     """
     batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
     if len(batches) > 1 and len(batches[-1]) == 1:
@@ -122,6 +187,9 @@ def config_dict(args):
         "auc_test_rounds": args.auc_test_rounds,
         "negsamp_ratio": args.negsamp_ratio,
         "rwr_restart_prob": args.rwr_restart_prob,
+        "subgraph_resample_interval": getattr(args, "subgraph_resample_interval", 1),
+        "amp": bool(getattr(args, "amp", False)),
+        "memory_mode": "sparse_subgraph_cpu_features_v2",
     }
 
 
@@ -215,77 +283,180 @@ def compute_auc_auprc(y_true, y_score):
     return float(auc_value), float(auprc_value)
 
 
-def load_and_preprocess(args, device):
-    # Load and preprocess data. Default path: ~/datasets/GAD/mat/<dataset>.mat
+def load_and_preprocess(args) -> PreparedData:
+    """Load dataset once and keep memory-heavy objects sparse/CPU-side."""
     adj, features, _, _, _, _, ano_label, _, _ = load_mat(args.dataset, data_dir=args.data_dir)
+    adj = adj.tocsr().astype(np.float32)
 
     degree = np.asarray(adj.sum(axis=0)).reshape(-1)
     degree_ave = float(np.mean(degree))
 
     features, _ = preprocess_features(features)
+    features = np.asarray(features, dtype=np.float32)
     nb_nodes = features.shape[0]
     ft_size = features.shape[1]
 
-    # PyG-style graph representation for DGL-free RWR subgraph sampling.
     edge_index = adj_to_edge_index(adj)
     neighbor_list = build_neighbor_dict(edge_index, nb_nodes)
 
-    adj, adj_raw = normalize_adj(adj)
-    adj = (adj + sp.eye(adj.shape[0])).todense()
-    adj_raw = np.asarray(adj_raw.todense())
+    norm_adj, adj_raw = normalize_adj(adj)
+    norm_adj = (norm_adj + sp.eye(norm_adj.shape[0], dtype=np.float32, format="csr")).tocsr().astype(np.float32)
+    adj_lookup = build_weight_lookup(norm_adj)
 
-    features = torch.as_tensor(np.asarray(features), dtype=torch.float32, device=device)
-    adj = torch.as_tensor(np.asarray(adj), dtype=torch.float32, device=device)
+    adj_raw = adj_raw.tocsr().astype(np.float32)
+    adj_raw.setdiag(0)
+    adj_raw.eliminate_zeros()
 
-    return adj, adj_raw, features, ano_label, degree_ave, nb_nodes, ft_size, neighbor_list
+    return PreparedData(
+        adj_lookup=adj_lookup,
+        adj_raw=adj_raw,
+        features_cpu=torch.from_numpy(features),
+        labels=np.asarray(ano_label).reshape(-1).astype(np.int64),
+        degree_ave=degree_ave,
+        nb_nodes=nb_nodes,
+        ft_size=ft_size,
+        neighbor_list=neighbor_list,
+    )
 
 
-def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_tune: bool=False):
+def maybe_generate_subgraphs(data: PreparedData, args, round_id: int, cached_subgraphs):
+    interval = max(1, int(getattr(args, "subgraph_resample_interval", 1)))
+    if cached_subgraphs is None or round_id % interval == 0:
+        return generate_rwr_subgraph(
+            data.neighbor_list,
+            num_nodes=data.nb_nodes,
+            subgraph_size=args.subgraph_size,
+            restart_prob=args.rwr_restart_prob,
+        )
+    return cached_subgraphs
+
+
+def copy_state_to_cpu(model: nn.Module):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def autocast_context(use_amp: bool):
+    if not use_amp:
+        return nullcontext()
+    if hasattr(torch, "amp"):
+        return torch.amp.autocast("cuda")
+    return torch.cuda.amp.autocast()
+
+
+def make_grad_scaler(use_amp: bool):
+    if not use_amp:
+        return None
+    if hasattr(torch, "amp"):
+        try:
+            return torch.amp.GradScaler("cuda")
+        except TypeError:
+            pass
+    return torch.cuda.amp.GradScaler()
+
+
+def compute_structure_scores(nodes_embed: torch.Tensor, adj_raw: sp.csr_matrix, degree_ave: float, nb_nodes: int) -> np.ndarray:
+    """Compute topology anomaly scores without materializing an N*N similarity matrix.
+
+    For L2-normalized embeddings z_i:
+        sum_{i != j} z_i^T z_j = ||sum_i z_i||_2^2 - n
+    This is exactly the same aggregate used by the old code, but it reduces the
+    memory footprint from O(N^2) to O(N*d).
+    """
+    features_norm = F.normalize(nodes_embed, p=2, dim=1).detach().cpu().numpy().astype(np.float32)
+
+    try:
+        net = nx.from_scipy_sparse_array(adj_raw)
+    except AttributeError:  # networkx < 3.0
+        net = nx.from_scipy_sparse_matrix(adj_raw)
+    net.remove_edges_from(nx.selfloop_edges(net))
+
+    k_init = max(1, int(degree_ave))
+    score_sum = np.zeros(nb_nodes, dtype=np.float32)
+    num_score_vectors = 0
+
+    while True:
+        core_nodes = list(nx.k_core(net, k_init))
+        if len(core_nodes) == 0:
+            break
+
+        sub_net = net.subgraph(core_nodes)
+        for component in nx.connected_components(sub_net):
+            core_temp = np.fromiter(component, dtype=np.int64)
+            core_temp_size = int(core_temp.size)
+            if core_temp_size <= 1:
+                continue
+
+            z = features_norm[core_temp]
+            sum_vec = z.sum(axis=0, dtype=np.float64)
+            diag_sum = float(np.einsum("ij,ij->i", z, z, dtype=np.float64).sum())
+            similar_num = core_temp_size * (core_temp_size - 1)
+            similar_temp = float(np.dot(sum_vec, sum_vec) - diag_sum)
+            if similar_num == 0 or similar_temp <= 0:
+                continue
+
+            score_value = core_temp_size / (similar_temp / similar_num)
+            score_sum[core_temp] += np.float32(score_value)
+            num_score_vectors += 1
+        k_init += 1
+
+    if num_score_vectors == 0:
+        return np.zeros(nb_nodes, dtype=np.float32)
+
+    stru_ano_score = score_sum / float(num_score_vectors)
+    return MinMaxScaler().fit_transform(stru_ano_score.reshape(-1, 1)).reshape(-1).astype(np.float32)
+
+
+def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_tune: bool = False,
+                  data: PreparedData = None):
     seed = trial
     set_seed(seed)
 
-    adj, adj_raw, features, ano_label, degree_ave, nb_nodes, ft_size, neighbor_list = load_and_preprocess(args, device)
+    if data is None:
+        data = load_and_preprocess(args)
 
-    model = Model(ft_size, args.embedding_dim, "prelu", args.negsamp_ratio, args.readout).to(device)
+    model = Model(data.ft_size, args.embedding_dim, "prelu", args.negsamp_ratio, args.readout).to(device)
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     b_xent = nn.BCEWithLogitsLoss(
         reduction="none",
         pos_weight=torch.tensor([args.negsamp_ratio], dtype=torch.float32, device=device),
     )
-    batch_num = nb_nodes // args.batch_size + 1
-    best = 1e9
+    use_amp = bool(getattr(args, "amp", False) and device.type == "cuda")
+    scaler = make_grad_scaler(use_amp)
+
+    best = float("inf")
+    best_state = copy_state_to_cpu(model)
+    cached_subgraphs = None
 
     # Train model
-    for epoch in trange(args.num_epoch, desc=f"Epoch", position=1 if is_tune else 0, leave=not is_tune):
+    for epoch in trange(args.num_epoch, desc="Epoch", position=1 if is_tune else 0, leave=not is_tune):
         model.train()
-        all_idx = list(range(nb_nodes))
+        all_idx = list(range(data.nb_nodes))
         random.shuffle(all_idx)
         total_loss = 0.0
-        last_loss = 0.0
-        last_batch_size = 0
-
-        subgraphs = generate_rwr_subgraph(
-            neighbor_list,
-            num_nodes=nb_nodes,
-            subgraph_size=args.subgraph_size,
-            restart_prob=args.rwr_restart_prob,
-        )
-
         seen_nodes = 0
+        cached_subgraphs = maybe_generate_subgraphs(data, args, epoch, cached_subgraphs)
+
         for idx in iter_batches(all_idx, args.batch_size):
-            optimiser.zero_grad()
+            optimiser.zero_grad(set_to_none=True)
             cur_batch_size = len(idx)
             seen_nodes += cur_batch_size
-            lbl = torch.cat(
-                (torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio))
-            ).unsqueeze(1).to(device)
+            lbl = make_labels(cur_batch_size, args.negsamp_ratio, device)
+            ba, bf = make_batch_tensors(
+                idx, cached_subgraphs, data.adj_lookup, data.features_cpu, data.ft_size, args.subgraph_size, device
+            )
 
-            ba, bf = make_batch_tensors(idx, subgraphs, adj, features, ft_size, args.subgraph_size, device)
-            logits, _ = model(bf, ba)
-            loss_all = b_xent(logits, lbl)
-            loss = torch.mean(loss_all)
-            loss.backward()
-            optimiser.step()
+            with autocast_context(use_amp):
+                logits, _ = model(bf, ba)
+                loss_all = b_xent(logits, lbl)
+                loss = torch.mean(loss_all)
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimiser)
+                scaler.update()
+            else:
+                loss.backward()
+                optimiser.step()
 
             last_loss = float(loss.detach().cpu())
             total_loss += last_loss * cur_batch_size
@@ -293,101 +464,62 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
         mean_loss = total_loss / max(seen_nodes, 1)
         if mean_loss < best:
             best = mean_loss
-            torch.save(model.state_dict(), args.save_model_path)
+            best_state = copy_state_to_cpu(model)
 
-    # Test model
-    model.load_state_dict(torch.load(args.save_model_path, map_location=device))
+    if getattr(args, "save_best_model", False) and not is_tune:
+        torch.save(best_state, args.save_model_path)
+
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
 
-    multi_round_attr_ano_score = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float32)
-    nodes_embed = torch.zeros([nb_nodes, args.embedding_dim], dtype=torch.float32, device=device)
+    # Test model. Accumulate the mean directly instead of storing [rounds, nodes].
+    attr_score_sum = np.zeros(data.nb_nodes, dtype=np.float64)
+    nodes_embed = torch.zeros([data.nb_nodes, args.embedding_dim], dtype=torch.float32, device=device)
+    cached_subgraphs = None
 
-    for test_round in trange(args.auc_test_rounds, desc="Test", position=1 if is_tune else 0, leave=not is_tune):
-        all_idx = list(range(nb_nodes))
-        random.shuffle(all_idx)
-        subgraphs = generate_rwr_subgraph(
-            neighbor_list,
-            num_nodes=nb_nodes,
-            subgraph_size=args.subgraph_size,
-            restart_prob=args.rwr_restart_prob,
-        )
+    with torch.no_grad():
+        for test_round in trange(args.auc_test_rounds, desc="Test", position=1 if is_tune else 0, leave=not is_tune):
+            all_idx = list(range(data.nb_nodes))
+            random.shuffle(all_idx)
+            cached_subgraphs = maybe_generate_subgraphs(data, args, test_round, cached_subgraphs)
 
-        for idx in iter_batches(all_idx, args.batch_size):
-            cur_batch_size = len(idx)
-            ba, bf = make_batch_tensors(idx, subgraphs, adj, features, ft_size, args.subgraph_size, device)
-
-            with torch.no_grad():
-                logits, batch_embed = model(bf, ba)
-                logits = torch.sigmoid(torch.squeeze(logits))
+            for idx in iter_batches(all_idx, args.batch_size):
+                cur_batch_size = len(idx)
+                ba, bf = make_batch_tensors(
+                    idx, cached_subgraphs, data.adj_lookup, data.features_cpu, data.ft_size, args.subgraph_size, device
+                )
+                with autocast_context(use_amp):
+                    logits, batch_embed = model(bf, ba)
+                    logits = torch.sigmoid(torch.squeeze(logits))
                 if test_round == args.auc_test_rounds - 1:
-                    nodes_embed[idx] = batch_embed
+                    nodes_embed[idx] = batch_embed.float()
 
-            pos_logits = logits[:cur_batch_size]
-            neg_logits = logits[cur_batch_size:].view(args.negsamp_ratio, cur_batch_size).mean(dim=0)
-            attr_ano_score = -(pos_logits - neg_logits).detach().cpu().numpy()
-            multi_round_attr_ano_score[test_round, idx] = attr_ano_score
+                pos_logits = logits[:cur_batch_size]
+                neg_logits = logits[cur_batch_size:].view(args.negsamp_ratio, cur_batch_size).mean(dim=0)
+                attr_ano_score = -(pos_logits - neg_logits).detach().float().cpu().numpy()
+                attr_score_sum[idx] += attr_ano_score
 
-    # Attribute anomaly scores
-    attr_ano_score_final = np.mean(multi_round_attr_ano_score, axis=0)
-    attr_scaler = MinMaxScaler()
-    attr_ano_score_final = attr_scaler.fit_transform(attr_ano_score_final.reshape(-1, 1)).reshape(-1)
+    attr_ano_score_final = (attr_score_sum / max(1, args.auc_test_rounds)).astype(np.float32)
+    attr_ano_score_final = MinMaxScaler().fit_transform(attr_ano_score_final.reshape(-1, 1)).reshape(-1).astype(np.float32)
 
-    # Topology anomaly scores
-    features_norm = F.normalize(nodes_embed, p=2, dim=1)
-    features_similarity = torch.matmul(features_norm, features_norm.transpose(0, 1)).detach().cpu().numpy()
-
-    k_init = max(1, int(degree_ave))
-    net = nx.from_numpy_array(adj_raw)
-    net.remove_edges_from(nx.selfloop_edges(net))
-    adj_raw_no_loop = nx.to_numpy_array(net)
-    multi_round_stru_ano_score = []
-
-    while True:
-        list_temp = list(nx.k_core(net, k_init))
-        if len(list_temp) == 0:
-            break
-        core_adj = adj_raw_no_loop[list_temp, :][:, list_temp]
-        core_graph = nx.from_numpy_array(core_adj)
-        list_temp = np.array(list_temp)
-        for component in nx.connected_components(core_graph):
-            core_temp = list_temp[list(component)]
-            core_temp_size = len(core_temp)
-            if core_temp_size <= 1:
-                continue
-            sim_block = features_similarity[np.ix_(core_temp, core_temp)]
-            similar_num = core_temp_size * (core_temp_size - 1)
-            similar_temp = float(sim_block.sum() - np.trace(sim_block))
-            if similar_num == 0 or similar_temp == 0:
-                continue
-            scores_temp = np.zeros(nb_nodes, dtype=np.float32)
-            scores_temp[core_temp] = core_temp_size / (similar_temp / similar_num)
-            multi_round_stru_ano_score.append(scores_temp)
-        k_init += 1
-
-    if len(multi_round_stru_ano_score) == 0:
-        stru_ano_score_final = np.zeros(nb_nodes, dtype=np.float32)
-    else:
-        multi_round_stru_ano_score = np.array(multi_round_stru_ano_score)
-        multi_round_stru_ano_score = np.mean(multi_round_stru_ano_score, axis=0)
-        stru_scaler = MinMaxScaler()
-        stru_ano_score_final = stru_scaler.fit_transform(multi_round_stru_ano_score.reshape(-1, 1)).reshape(-1)
+    stru_ano_score_final = compute_structure_scores(nodes_embed, data.adj_raw, data.degree_ave, data.nb_nodes)
 
     alpha_list = list(np.arange(0, 1, 0.2))
     rate_auc = []
     for alpha in alpha_list:
         final_scores_rate = alpha * attr_ano_score_final + (1 - alpha) * stru_ano_score_final
-        auc_temp, _ = compute_auc_auprc(ano_label, final_scores_rate)
+        auc_temp, _ = compute_auc_auprc(data.labels, final_scores_rate)
         rate_auc.append(auc_temp)
     max_alpha = alpha_list[rate_auc.index(max(rate_auc))]
     final_scores_rate = max_alpha * attr_ano_score_final + (1 - max_alpha) * stru_ano_score_final
-    best_auc, best_auprc = compute_auc_auprc(ano_label, final_scores_rate)
+    best_auc, best_auprc = compute_auc_auprc(data.labels, final_scores_rate)
 
     score_file = "None"
     if not is_tune:
         score_file = trial_score_path(results_dir, args.dataset, cfg_key, trial)
         np.savez_compressed(
             score_file,
-            y_true=np.asarray(ano_label).reshape(-1).astype(np.int64),
+            y_true=data.labels.astype(np.int64),
             y_score=np.asarray(final_scores_rate).reshape(-1).astype(np.float32),
             attr_score=np.asarray(attr_ano_score_final).reshape(-1).astype(np.float32),
             stru_score=np.asarray(stru_ano_score_final).reshape(-1).astype(np.float32),
@@ -395,6 +527,11 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
             auc=np.asarray(best_auc, dtype=np.float32),
             auprc=np.asarray(best_auprc, dtype=np.float32),
         )
+
+    del model, optimiser, nodes_embed
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
         "trial": trial,
@@ -420,6 +557,9 @@ def main():
     metrics_csv = results_dir / "trial_metrics.csv"
     summary_csv = Path(os.path.expanduser(args.summary_csv)) if args.summary_csv else results_dir / "summary.csv"
 
+    print("Loading and preprocessing dataset once...")
+    data = load_and_preprocess(args)
+
     completed = {} if args.rerun_completed else read_trial_metrics(metrics_csv, cfg_key, results_dir, args.dataset)
     target_trials = list(range(1, args.runs + 1))
     pending_trials = [trial for trial in target_trials if trial not in completed]
@@ -429,10 +569,11 @@ def main():
     else:
         print(f"Will run {len(pending_trials)} trial(s).")
     print("Config key:", cfg_key)
+    print("Memory mode: sparse subgraph adjacency + CPU feature cache")
 
     trial_results = {trial: completed[trial] for trial in completed if trial in target_trials}
-    for trial in pending_trials:
-        result = run_one_trial(args, trial, device, results_dir, cfg_key)
+    for trial in tqdm(pending_trials, desc="Trials"):
+        result = run_one_trial(args, trial, device, results_dir, cfg_key, data=data)
         trial_results[trial] = result
         append_csv_row(metrics_csv, metric_fields(), {
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),

@@ -48,19 +48,20 @@ def preprocess_features(features):
     r_inv[~np.isfinite(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
     features = r_mat_inv.dot(features)
-    return features.todense(), sparse_to_tuple(features)
+    return np.asarray(features.todense(), dtype=np.float32), sparse_to_tuple(features)
 
 
 def normalize_adj(adj):
     """Symmetrically normalize adjacency matrix."""
-    adj = sp.coo_matrix(adj)
-    rowsum = np.array(adj.sum(1))
+    adj = sp.coo_matrix(adj, dtype=np.float32)
+    rowsum = np.array(adj.sum(1), dtype=np.float32)
     adj_raw = adj
     with np.errstate(divide="ignore", invalid="ignore"):
         d_inv_sqrt = np.power(rowsum, -0.5).flatten()
     d_inv_sqrt[~np.isfinite(d_inv_sqrt)] = 0.0
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-    return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo(), adj_raw
+    norm_adj = adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo().astype(np.float32)
+    return norm_adj, adj_raw.astype(np.float32)
 
 
 def dense_to_one_hot(labels_dense, num_classes):
@@ -114,8 +115,8 @@ def load_mat(dataset, data_dir: Optional[str] = None, train_rate=0.3, val_rate=0
     attr = _get_first_key(data, ["Attributes", "X", "attr", "features", "Feat"])
     network = _get_first_key(data, ["Network", "A", "adj"])
 
-    adj = sp.csr_matrix(network)
-    feat = sp.lil_matrix(attr)
+    adj = sp.csr_matrix(network, dtype=np.float32)
+    feat = sp.csr_matrix(attr, dtype=np.float32)
 
     class_raw = _get_first_key(data, ["Class", "class", "labels"], required=False)
     if class_raw is not None:
@@ -250,3 +251,20 @@ def generate_rwr_subgraph(edge_index_or_neighbors, num_nodes: Optional[int] = No
         subgraphs.append(nodes)
 
     return subgraphs
+
+
+def build_weight_lookup(adj: sp.spmatrix) -> List[Dict[int, float]]:
+    """Build row-wise sparse weight dictionaries for tiny subgraph extraction.
+
+    This avoids materializing a dense N*N adjacency matrix on CPU/GPU.  The
+    returned object is optimized for queries like weight_lookup[u].get(v) where
+    each mini-batch only needs a few node pairs.
+    """
+    adj = adj.tocsr().astype(np.float32)
+    lookup: List[Dict[int, float]] = []
+    for row in range(adj.shape[0]):
+        start, end = adj.indptr[row], adj.indptr[row + 1]
+        cols = adj.indices[start:end]
+        vals = adj.data[start:end]
+        lookup.append({int(c): float(v) for c, v in zip(cols, vals)})
+    return lookup

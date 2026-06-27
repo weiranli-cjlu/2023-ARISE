@@ -29,7 +29,7 @@ from typing import Any, Dict
 import pandas as pd
 import torch
 
-from run import config_dict, config_key, ensure_dir, run_one_trial
+from run import config_dict, config_key, ensure_dir, load_and_preprocess, run_one_trial
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
                         help="Path of exported Optuna trials CSV. Default: <results_dir>/optuna_trials_<dataset>.csv")
     parser.add_argument("--final_results_dir", type=str, default=None,
                         help="Results directory used in the generated best-run script. Default: <results_dir>/best_run_results")
+    parser.add_argument("--subgraph_resample_interval", type=int, default=1,
+                        help="Regenerate RWR subgraphs every N epochs/test rounds. Larger values reduce CPU cost.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Use CUDA automatic mixed precision during tuning.")
+    parser.add_argument("--allow_large_search", action="store_true",
+                        help="Include larger, more expensive choices such as embedding_dim=256 and batch_size=512.")
     return parser.parse_args()
 
 
@@ -73,14 +79,21 @@ def default_storage_url(results_dir: Path, study_name: str) -> str:
     return "sqlite:///" + str(db_path.resolve())
 
 
-def sample_params(trial: Any) -> Dict[str, Any]:
-    """Define the ARISE hyperparameter search space."""
+def sample_params(trial: Any, allow_large_search: bool = False) -> Dict[str, Any]:
+    """Define the ARISE hyperparameter search space.
+
+    The default space avoids the largest hidden dimension and batch size to keep
+    tuning usable on memory-limited GPUs. Use --allow_large_search to recover the
+    previous broader space.
+    """
+    embedding_choices = [32, 64, 128, 256] if allow_large_search else [32, 64, 128]
+    batch_choices = [128, 256, 300, 512] if allow_large_search else [128, 256, 300]
     return {
         "num_epoch": trial.suggest_categorical("num_epoch", [10, 100, 200, 500]),
         "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
         "weight_decay": trial.suggest_float("weight_decay", 1e-8, 1e-3, log=True),
-        "embedding_dim": trial.suggest_categorical("embedding_dim", [32, 64, 128, 256]),
-        "batch_size": trial.suggest_categorical("batch_size", [128, 256, 300, 512]),
+        "embedding_dim": trial.suggest_categorical("embedding_dim", embedding_choices),
+        "batch_size": trial.suggest_categorical("batch_size", batch_choices),
         "subgraph_size": trial.suggest_int("subgraph_size", 3, 8),
         "readout": trial.suggest_categorical("readout", ["avg", "max", "min", "weighted_sum"]),
         "negsamp_ratio": trial.suggest_int("negsamp_ratio", 1, 3),
@@ -106,8 +119,11 @@ def build_train_args(args: argparse.Namespace, params: Dict[str, Any], optuna_tr
         negsamp_ratio=int(params["negsamp_ratio"]),
         rwr_restart_prob=float(params["rwr_restart_prob"]),
         save_model_path="best_model.pt",
+        save_best_model=False,
         summary_csv=None,
         rerun_completed=True,
+        subgraph_resample_interval=int(args.subgraph_resample_interval),
+        amp=bool(args.amp),
     )
 
 
@@ -134,7 +150,10 @@ def write_best_run_script(args: argparse.Namespace, best_params: Dict[str, Any],
         "--auc_test_rounds", args.auc_test_rounds,
         "--negsamp_ratio", best_params["negsamp_ratio"],
         "--rwr_restart_prob", best_params["rwr_restart_prob"],
+        "--subgraph_resample_interval", args.subgraph_resample_interval,
     ]
+    if args.amp:
+        cmd.append("--amp")
 
     script = "\n".join([
         shell_join(cmd)
@@ -186,6 +205,9 @@ def main() -> None:
         raise SystemExit("Optuna is not installed. Install it with: pip install optuna pandas tqdm") from exc
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Loading and preprocessing dataset once for all Optuna trials...")
+    data = load_and_preprocess(args)
+
     sampler = TPESampler(seed=args.seed)
     study = optuna.create_study(
         study_name=args.study_name,
@@ -196,7 +218,7 @@ def main() -> None:
     )
 
     def objective(trial: Any) -> float:
-        params = sample_params(trial)
+        params = sample_params(trial, allow_large_search=args.allow_large_search)
         train_args = build_train_args(args, params, trial.number)
         cfg_key = config_key(train_args)
         run_seed = int(trial.number + 1)
@@ -206,7 +228,7 @@ def main() -> None:
         trial.set_user_attr("seed", run_seed)
 
         try:
-            result = run_one_trial(train_args, run_seed, device, "", cfg_key, is_tune=True)
+            result = run_one_trial(train_args, run_seed, device, "", cfg_key, is_tune=True, data=data)
             value = float(result[args.tune_metric])
             trial.set_user_attr("auc", float(result["auc"]))
             trial.set_user_attr("auprc", float(result["auprc"]))
