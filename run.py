@@ -10,7 +10,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 import networkx as nx
 import numpy as np
@@ -24,8 +24,7 @@ from tqdm import tqdm, trange
 
 from model import Model
 from utils import (
-    adj_to_edge_index,
-    build_neighbor_dict,
+    build_neighbor_list_from_adj,
     build_weight_lookup,
     generate_rwr_subgraph,
     load_mat,
@@ -52,7 +51,8 @@ class PreparedData:
     degree_ave: float
     nb_nodes: int
     ft_size: int
-    neighbor_list: List[List[int]]
+    neighbor_list: List[np.ndarray]
+    label_cache: Dict[int, torch.Tensor]
 
 
 def parse_args():
@@ -86,6 +86,8 @@ def parse_args():
                         help="Final summary csv path. Default: <results_dir>/summary.csv")
     parser.add_argument("--rerun_completed", action="store_true",
                         help="Ignore completed trial files and rerun all trials.")
+    parser.add_argument("--keep_cuda_cache", action="store_true",
+                        help="Do not call torch.cuda.empty_cache() after each trial. Faster for many trials, but may keep more cached GPU memory.")
     return parser.parse_args()
 
 
@@ -104,21 +106,21 @@ def set_seed(seed: int):
 
 
 def _subgraphs_to_numpy(idx: Sequence[int], subgraphs) -> np.ndarray:
-    return np.asarray([subgraphs[i] for i in idx], dtype=np.int64)
+    if isinstance(subgraphs, np.ndarray):
+        return subgraphs[np.asarray(idx, dtype=np.int64)]
+    return np.asarray([subgraphs[int(i)] for i in idx], dtype=np.int64)
 
 
 def make_batch_tensors(idx, subgraphs, adj_lookup, features_cpu, ft_size, subgraph_size, device):
     """Build only the mini-batch subgraph tensors instead of storing dense N*N adjacency.
 
-    Final tensor layout intentionally matches the previous implementation:
-      - adjacency: original subgraph block + one zero row/column whose self-loop is 1
-      - feature: [neighbors, zero-vector, seed]
+    The function returns ``idx_dev`` as well so testing can accumulate scores on
+    GPU without synchronizing every mini-batch.
     """
-    cur_batch_size = len(idx)
-    sub_idx_np = _subgraphs_to_numpy(idx, subgraphs)
+    idx_np = np.asarray(idx, dtype=np.int64)
+    cur_batch_size = int(idx_np.size)
+    sub_idx_np = _subgraphs_to_numpy(idx_np, subgraphs)
 
-    # Build the small batched adjacency on CPU.  subgraph_size is usually 3-8,
-    # so dictionary lookup is far cheaper in memory than dense global adjacency.
     ba_np = np.zeros((cur_batch_size, subgraph_size + 1, subgraph_size + 1), dtype=np.float32)
     for b, nodes in enumerate(sub_idx_np):
         for r, src in enumerate(nodes):
@@ -140,30 +142,35 @@ def make_batch_tensors(idx, subgraphs, adj_lookup, features_cpu, ft_size, subgra
 
     ba = torch.from_numpy(ba_np).to(device=device, non_blocking=True)
     bf = bf.to(device=device, non_blocking=True)
-    return ba, bf
+    idx_dev = torch.from_numpy(idx_np).to(device=device, non_blocking=True)
+    return ba, bf, idx_dev
 
 
-def make_labels(cur_batch_size: int, negsamp_ratio: int, device):
+def make_labels(cur_batch_size: int, negsamp_ratio: int, device, cache: Dict[int, torch.Tensor] = None):
+    # Most batches share the same size.  Caching labels avoids allocating and
+    # filling an identical tensor for every mini-batch.
+    if cache is not None and cur_batch_size in cache:
+        return cache[cur_batch_size]
     lbl = torch.empty((cur_batch_size * (1 + negsamp_ratio), 1), dtype=torch.float32, device=device)
     lbl[:cur_batch_size].fill_(1.0)
     lbl[cur_batch_size:].zero_()
+    if cache is not None:
+        cache[cur_batch_size] = lbl
     return lbl
 
 
 def iter_batches(indices, batch_size):
-    """Yield batches while avoiding a final singleton batch.
-
-    The discriminator uses in-batch cyclic-shift negative sampling. A batch of
-    one node cannot provide a real in-batch negative sample, so when the last
-    chunk has length 1 we merge it into the previous chunk.
-    """
-    batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
-    if len(batches) > 1 and len(batches[-1]) == 1:
-        batches[-2].extend(batches[-1])
-        batches.pop()
-    for batch in batches:
-        if batch:
+    """Yield batches without materializing a list of all batches."""
+    n = len(indices)
+    i = 0
+    while i < n:
+        end = min(i + batch_size, n)
+        if end < n and n - end == 1:
+            end = n
+        batch = indices[i:end]
+        if len(batch):
             yield batch
+        i = end
 
 
 def ensure_dir(path: Path) -> Path:
@@ -189,7 +196,8 @@ def config_dict(args):
         "rwr_restart_prob": args.rwr_restart_prob,
         "subgraph_resample_interval": getattr(args, "subgraph_resample_interval", 1),
         "amp": bool(getattr(args, "amp", False)),
-        "memory_mode": "sparse_subgraph_cpu_features_v2",
+        "keep_cuda_cache": bool(getattr(args, "keep_cuda_cache", False)),
+        "memory_mode": "sparse_subgraph_cpu_features_v3",
     }
 
 
@@ -296,8 +304,7 @@ def load_and_preprocess(args) -> PreparedData:
     nb_nodes = features.shape[0]
     ft_size = features.shape[1]
 
-    edge_index = adj_to_edge_index(adj)
-    neighbor_list = build_neighbor_dict(edge_index, nb_nodes)
+    neighbor_list = build_neighbor_list_from_adj(adj)
 
     norm_adj, adj_raw = normalize_adj(adj)
     norm_adj = (norm_adj + sp.eye(norm_adj.shape[0], dtype=np.float32, format="csr")).tocsr().astype(np.float32)
@@ -316,6 +323,7 @@ def load_and_preprocess(args) -> PreparedData:
         nb_nodes=nb_nodes,
         ft_size=ft_size,
         neighbor_list=neighbor_list,
+        label_cache={},
     )
 
 
@@ -331,8 +339,12 @@ def maybe_generate_subgraphs(data: PreparedData, args, round_id: int, cached_sub
     return cached_subgraphs
 
 
-def copy_state_to_cpu(model: nn.Module):
-    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+def copy_state(model: nn.Module, to_cpu: bool = False):
+    state = {}
+    for k, v in model.state_dict().items():
+        t = v.detach().clone()
+        state[k] = t.cpu() if to_cpu else t
+    return state
 
 
 def autocast_context(use_amp: bool):
@@ -374,12 +386,24 @@ def compute_structure_scores(nodes_embed: torch.Tensor, adj_raw: sp.csr_matrix, 
     score_sum = np.zeros(nb_nodes, dtype=np.float32)
     num_score_vectors = 0
 
-    while True:
-        core_nodes = list(nx.k_core(net, k_init))
-        if len(core_nodes) == 0:
-            break
+    if net.number_of_edges() == 0:
+        return np.zeros(nb_nodes, dtype=np.float32)
 
-        sub_net = net.subgraph(core_nodes)
+    # nx.k_core(net, k) recomputes core numbers each time.  Computing coreness
+    # once and filtering by k avoids repeated O(E) preprocessing for every k.
+    core_number = nx.core_number(net)
+    if not core_number:
+        return np.zeros(nb_nodes, dtype=np.float32)
+    core_nodes_all = np.fromiter(core_number.keys(), dtype=np.int64)
+    core_values = np.fromiter(core_number.values(), dtype=np.int64)
+    max_core = int(core_values.max(initial=0))
+
+    for k in range(k_init, max_core + 1):
+        core_nodes = core_nodes_all[core_values >= k]
+        if core_nodes.size == 0:
+            continue
+
+        sub_net = net.subgraph(core_nodes.tolist())
         for component in nx.connected_components(sub_net):
             core_temp = np.fromiter(component, dtype=np.int64)
             core_temp_size = int(core_temp.size)
@@ -397,7 +421,6 @@ def compute_structure_scores(nodes_embed: torch.Tensor, adj_raw: sp.csr_matrix, 
             score_value = core_temp_size / (similar_temp / similar_num)
             score_sum[core_temp] += np.float32(score_value)
             num_score_vectors += 1
-        k_init += 1
 
     if num_score_vectors == 0:
         return np.zeros(nb_nodes, dtype=np.float32)
@@ -424,14 +447,14 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
     scaler = make_grad_scaler(use_amp)
 
     best = float("inf")
-    best_state = copy_state_to_cpu(model)
+    best_state = copy_state(model, to_cpu=False)
+    data.label_cache.clear()
     cached_subgraphs = None
 
     # Train model
     for epoch in trange(args.num_epoch, desc="Epoch", position=1 if is_tune else 0, leave=not is_tune):
         model.train()
-        all_idx = list(range(data.nb_nodes))
-        random.shuffle(all_idx)
+        all_idx = np.random.permutation(data.nb_nodes)
         total_loss = 0.0
         seen_nodes = 0
         cached_subgraphs = maybe_generate_subgraphs(data, args, epoch, cached_subgraphs)
@@ -440,8 +463,8 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
             optimiser.zero_grad(set_to_none=True)
             cur_batch_size = len(idx)
             seen_nodes += cur_batch_size
-            lbl = make_labels(cur_batch_size, args.negsamp_ratio, device)
-            ba, bf = make_batch_tensors(
+            lbl = make_labels(cur_batch_size, args.negsamp_ratio, device, data.label_cache)
+            ba, bf, _ = make_batch_tensors(
                 idx, cached_subgraphs, data.adj_lookup, data.features_cpu, data.ft_size, args.subgraph_size, device
             )
 
@@ -458,48 +481,49 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
                 loss.backward()
                 optimiser.step()
 
-            last_loss = float(loss.detach().cpu())
-            total_loss += last_loss * cur_batch_size
+            total_loss += loss.detach() * cur_batch_size
 
-        mean_loss = total_loss / max(seen_nodes, 1)
+        if torch.is_tensor(total_loss):
+            mean_loss = float((total_loss / max(seen_nodes, 1)).detach().cpu())
+        else:
+            mean_loss = float(total_loss / max(seen_nodes, 1))
         if mean_loss < best:
             best = mean_loss
-            best_state = copy_state_to_cpu(model)
+            best_state = copy_state(model, to_cpu=False)
 
     if getattr(args, "save_best_model", False) and not is_tune:
-        torch.save(best_state, args.save_model_path)
+        torch.save({k: v.detach().cpu() for k, v in best_state.items()}, args.save_model_path)
 
-    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.load_state_dict(best_state)
     model.eval()
 
     # Test model. Accumulate the mean directly instead of storing [rounds, nodes].
-    attr_score_sum = np.zeros(data.nb_nodes, dtype=np.float64)
+    attr_score_sum = torch.zeros(data.nb_nodes, dtype=torch.float32, device=device)
     nodes_embed = torch.zeros([data.nb_nodes, args.embedding_dim], dtype=torch.float32, device=device)
     cached_subgraphs = None
 
     with torch.no_grad():
         for test_round in trange(args.auc_test_rounds, desc="Test", position=1 if is_tune else 0, leave=not is_tune):
-            all_idx = list(range(data.nb_nodes))
-            random.shuffle(all_idx)
+            all_idx = np.random.permutation(data.nb_nodes)
             cached_subgraphs = maybe_generate_subgraphs(data, args, test_round, cached_subgraphs)
 
             for idx in iter_batches(all_idx, args.batch_size):
                 cur_batch_size = len(idx)
-                ba, bf = make_batch_tensors(
+                ba, bf, idx_dev = make_batch_tensors(
                     idx, cached_subgraphs, data.adj_lookup, data.features_cpu, data.ft_size, args.subgraph_size, device
                 )
                 with autocast_context(use_amp):
                     logits, batch_embed = model(bf, ba)
                     logits = torch.sigmoid(torch.squeeze(logits))
                 if test_round == args.auc_test_rounds - 1:
-                    nodes_embed[idx] = batch_embed.float()
+                    nodes_embed.index_copy_(0, idx_dev, batch_embed.float())
 
                 pos_logits = logits[:cur_batch_size]
                 neg_logits = logits[cur_batch_size:].view(args.negsamp_ratio, cur_batch_size).mean(dim=0)
-                attr_ano_score = -(pos_logits - neg_logits).detach().float().cpu().numpy()
-                attr_score_sum[idx] += attr_ano_score
+                attr_ano_score = -(pos_logits - neg_logits).detach().float()
+                attr_score_sum.index_add_(0, idx_dev, attr_ano_score)
 
-    attr_ano_score_final = (attr_score_sum / max(1, args.auc_test_rounds)).astype(np.float32)
+    attr_ano_score_final = (attr_score_sum / max(1, args.auc_test_rounds)).detach().cpu().numpy().astype(np.float32)
     attr_ano_score_final = MinMaxScaler().fit_transform(attr_ano_score_final.reshape(-1, 1)).reshape(-1).astype(np.float32)
 
     stru_ano_score_final = compute_structure_scores(nodes_embed, data.adj_raw, data.degree_ave, data.nb_nodes)
@@ -528,9 +552,9 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
             auprc=np.asarray(best_auprc, dtype=np.float32),
         )
 
-    del model, optimiser, nodes_embed
+    del model, optimiser, nodes_embed, attr_score_sum, best_state
     gc.collect()
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not getattr(args, "keep_cuda_cache", False):
         torch.cuda.empty_cache()
 
     return {

@@ -1,5 +1,3 @@
-import sys
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,25 +89,18 @@ class Discriminator(nn.Module):
                 m.bias.data.fill_(0.0)
 
     def forward(self, c, h_pl):
-        scs = []
-        # positive
-        scs.append(self.f_k(h_pl, c))
+        # Vectorized cyclic negative sampling.  This avoids repeated small
+        # torch.cat/Bilinear calls while keeping the same output order:
+        # positive scores first, then negsamp_round shifted negatives.
+        if self.negsamp_round <= 0:
+            return self.f_k(h_pl, c)
 
-        # negative
-        # ARISE/DGI-style in-batch negative sampling is implemented by cyclically
-        # shifting the summary vectors.  The previous slice ``c_mi[-2:-1, :]``
-        # becomes empty when batch_size == 1, which can happen for datasets such
-        # as twitter when Optuna samples batch_size=256 (4865 % 256 == 1).
-        # ``-1:`` is the correct last-row slice and keeps the batch dimension
-        # valid for every batch size.
-        c_mi = c
-        for _ in range(self.negsamp_round):
-            c_mi = torch.cat((c_mi[-1:, :], c_mi[:-1, :]), dim=0)
-            scs.append(self.f_k(h_pl, c_mi))
-
-        logits = torch.cat(tuple(scs), dim=0)
-
-        return logits
+        c_samples = [c]
+        for shift in range(1, self.negsamp_round + 1):
+            c_samples.append(torch.roll(c, shifts=shift, dims=0))
+        c_all = torch.cat(c_samples, dim=0)
+        h_all = h_pl.repeat(self.negsamp_round + 1, 1)
+        return self.f_k(h_all, c_all)
 
 class Model(nn.Module):
     def __init__(self, n_in, n_h, activation, negsamp_round, readout):

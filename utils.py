@@ -1,7 +1,7 @@
 import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import scipy.io as sio
@@ -48,7 +48,7 @@ def preprocess_features(features):
     r_inv[~np.isfinite(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
     features = r_mat_inv.dot(features)
-    return np.asarray(features.todense(), dtype=np.float32), sparse_to_tuple(features)
+    return features.toarray().astype(np.float32, copy=False), sparse_to_tuple(features)
 
 
 def normalize_adj(adj):
@@ -161,18 +161,34 @@ def adj_to_edge_index(adj: sp.spmatrix) -> torch.Tensor:
     return torch.stack([row, col], dim=0)
 
 
-def build_neighbor_dict(edge_index: torch.Tensor, num_nodes: int) -> List[List[int]]:
-    """Build CPU neighbor lists from a PyG edge_index tensor."""
+def build_neighbor_dict(edge_index: torch.Tensor, num_nodes: int) -> List[np.ndarray]:
+    """Build CPU neighbor arrays from a PyG edge_index tensor."""
     neighbors: List[List[int]] = [[] for _ in range(num_nodes)]
     src = edge_index[0].cpu().tolist()
     dst = edge_index[1].cpu().tolist()
     for u, v in zip(src, dst):
         if u != v:
             neighbors[u].append(v)
+    return [np.asarray(nbrs, dtype=np.int64) for nbrs in neighbors]
+
+
+def build_neighbor_list_from_adj(adj: sp.spmatrix) -> List[np.ndarray]:
+    """Build compact NumPy neighbor arrays directly from a scipy sparse matrix.
+
+    This avoids the scipy -> torch edge_index -> Python list conversion path during
+    preprocessing and makes random-walk sampling cheaper.
+    """
+    adj = adj.tocsr()
+    neighbors: List[np.ndarray] = []
+    for row in range(adj.shape[0]):
+        start, end = adj.indptr[row], adj.indptr[row + 1]
+        cols = adj.indices[start:end]
+        cols = cols[cols != row]
+        neighbors.append(np.asarray(cols, dtype=np.int64))
     return neighbors
 
 
-def _single_rwr_trace(seed: int, neighbors: List[List[int]], restart_prob: float, max_steps: int) -> List[int]:
+def _single_rwr_trace(seed: int, neighbors: Sequence[np.ndarray], restart_prob: float, max_steps: int) -> List[int]:
     """A lightweight random-walk-with-restart sampler implemented with Python/Torch data.
 
     The implementation deliberately stays on CPU because subgraph generation is a
@@ -187,7 +203,7 @@ def _single_rwr_trace(seed: int, neighbors: List[List[int]], restart_prob: float
         if len(nbrs) == 0:
             cur = seed
         else:
-            cur = nbrs[random.randrange(len(nbrs))]
+            cur = int(nbrs[random.randrange(len(nbrs))])
         trace.append(cur)
     return trace
 
@@ -203,18 +219,13 @@ def _unique_keep_order(nodes: Sequence[int]) -> List[int]:
 
 
 def generate_rwr_subgraph(edge_index_or_neighbors, num_nodes: Optional[int] = None, subgraph_size: int = 4,
-                          restart_prob: float = 0.9) -> List[List[int]]:
+                          restart_prob: float = 0.9) -> np.ndarray:
     """Generate per-node RWR subgraphs without DGL.
 
-    Args:
-        edge_index_or_neighbors: PyG edge_index tensor with shape [2, E] or prebuilt neighbor list.
-        num_nodes: number of nodes, required when edge_index is given.
-        subgraph_size: returned subgraph size. The seed node is always placed at the last position
-            to preserve ARISE's original tensor layout.
-        restart_prob: restart probability for retry walks.
-
-    Returns:
-        A list whose i-th element contains ``subgraph_size`` node ids. The last id is i.
+    The return value is a dense ``int64`` array with shape ``[num_nodes, subgraph_size]``.
+    The seed node is always placed at the last position to preserve ARISE's original
+    tensor layout.  Compared with a list-of-lists, this makes mini-batch indexing
+    substantially cheaper in both training and testing.
     """
     if isinstance(edge_index_or_neighbors, torch.Tensor):
         if num_nodes is None:
@@ -226,29 +237,46 @@ def generate_rwr_subgraph(edge_index_or_neighbors, num_nodes: Optional[int] = No
             num_nodes = len(neighbors)
 
     reduced_size = subgraph_size - 1
-    subgraphs: List[List[int]] = []
+    subgraphs = np.empty((int(num_nodes), int(subgraph_size)), dtype=np.int64)
+    first_steps = max(subgraph_size * 5, 8)
+    retry_steps = max(subgraph_size * 8, 16)
 
-    for seed in range(num_nodes):
-        # First pass: low restart probability collects local context more effectively than DGL's
-        # deprecated contrib sampler on modern software stacks.
-        trace = _single_rwr_trace(seed, neighbors, restart_prob=restart_prob, max_steps=max(subgraph_size * 5, 8))
-        nodes = [n for n in _unique_keep_order(trace) if n != seed]
+    for seed in range(int(num_nodes)):
+        collected: List[int] = []
+        seen = {seed}
 
-        retry_time = 0
-        while len(nodes) < reduced_size and retry_time < 10:
-            trace = _single_rwr_trace(seed, neighbors, restart_prob=restart_prob, max_steps=max(subgraph_size * 8, 16))
-            nodes = [n for n in _unique_keep_order(trace) if n != seed]
-            retry_time += 1
+        # Accumulate unique nodes over retry walks instead of discarding the
+        # previous trace.  This keeps the sampler close to the old behavior but
+        # avoids many wasted retries when restart_prob is high.
+        for retry_time in range(11):
+            steps = first_steps if retry_time == 0 else retry_steps
+            trace = _single_rwr_trace(seed, neighbors, restart_prob=restart_prob, max_steps=steps)
+            for node in trace:
+                node = int(node)
+                if node not in seen:
+                    seen.add(node)
+                    collected.append(node)
+                    if len(collected) >= reduced_size:
+                        break
+            if len(collected) >= reduced_size:
+                break
 
-        if len(nodes) < reduced_size:
-            # Isolated or tiny-component nodes: pad with the seed itself. This keeps tensor shapes
-            # valid and mirrors the original code's repeated-node fallback.
-            nodes = (nodes + [seed] * reduced_size)[:reduced_size]
-        else:
-            nodes = nodes[:reduced_size]
+        if len(collected) < reduced_size:
+            # Fast deterministic fallback: use immediate neighbors before padding
+            # with the seed.  This reduces sampling time on sparse/tiny components.
+            for node in neighbors[seed]:
+                node = int(node)
+                if node not in seen:
+                    seen.add(node)
+                    collected.append(node)
+                    if len(collected) >= reduced_size:
+                        break
 
-        nodes.append(seed)
-        subgraphs.append(nodes)
+        if len(collected) < reduced_size:
+            collected.extend([seed] * (reduced_size - len(collected)))
+
+        subgraphs[seed, :reduced_size] = np.asarray(collected[:reduced_size], dtype=np.int64)
+        subgraphs[seed, reduced_size] = seed
 
     return subgraphs
 
