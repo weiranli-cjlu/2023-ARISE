@@ -83,6 +83,24 @@ def make_batch_tensors(idx, subgraphs, adj, features, ft_size, subgraph_size, de
     return ba, bf
 
 
+def iter_batches(indices, batch_size):
+    """Yield batches while avoiding a final singleton batch.
+
+    The discriminator uses in-batch cyclic-shift negative sampling.  A batch of
+    one node cannot provide a real in-batch negative sample, so when the last
+    chunk has length 1 we merge it into the previous chunk.  This preserves all
+    nodes during both training and testing and prevents shape/pathological-loss
+    issues for datasets such as twitter with 4865 nodes and batch_size=256.
+    """
+    batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
+    if len(batches) > 1 and len(batches[-1]) == 1:
+        batches[-2].extend(batches[-1])
+        batches.pop()
+    for batch in batches:
+        if batch:
+            yield batch
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -253,18 +271,11 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
             restart_prob=args.rwr_restart_prob,
         )
 
-        for batch_idx in range(batch_num):
-            is_final_batch = batch_idx == (batch_num - 1)
-            if not is_final_batch:
-                idx = all_idx[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size]
-            else:
-                idx = all_idx[batch_idx * args.batch_size:]
-            if len(idx) == 0:
-                continue
-
+        seen_nodes = 0
+        for idx in iter_batches(all_idx, args.batch_size):
             optimiser.zero_grad()
             cur_batch_size = len(idx)
-            last_batch_size = cur_batch_size
+            seen_nodes += cur_batch_size
             lbl = torch.cat(
                 (torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio))
             ).unsqueeze(1).to(device)
@@ -277,10 +288,9 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
             optimiser.step()
 
             last_loss = float(loss.detach().cpu())
-            if not is_final_batch:
-                total_loss += last_loss
+            total_loss += last_loss * cur_batch_size
 
-        mean_loss = (total_loss * args.batch_size + last_loss * last_batch_size) / nb_nodes
+        mean_loss = total_loss / max(seen_nodes, 1)
         if mean_loss < best:
             best = mean_loss
             torch.save(model.state_dict(), args.save_model_path)
@@ -302,15 +312,7 @@ def run_one_trial(args, trial: int, device, results_dir: Path, cfg_key: str, is_
             restart_prob=args.rwr_restart_prob,
         )
 
-        for batch_idx in range(batch_num):
-            is_final_batch = batch_idx == (batch_num - 1)
-            if not is_final_batch:
-                idx = all_idx[batch_idx * args.batch_size:(batch_idx + 1) * args.batch_size]
-            else:
-                idx = all_idx[batch_idx * args.batch_size:]
-            if len(idx) == 0:
-                continue
-
+        for idx in iter_batches(all_idx, args.batch_size):
             cur_batch_size = len(idx)
             ba, bf = make_batch_tensors(idx, subgraphs, adj, features, ft_size, args.subgraph_size, device)
 

@@ -222,6 +222,9 @@ def main() -> None:
         n_trials=args.n_trials,
         timeout=args.timeout,
         show_progress_bar=args.show_progress_bar,
+        # Do not stop the whole tuning process because one sampled configuration
+        # is numerically invalid or runs into a recoverable runtime error.
+        catch=(RuntimeError, ValueError),
     )
 
     best_script = write_best_run_script(args, study.best_params, float(study.best_value))

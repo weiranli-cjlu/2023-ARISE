@@ -96,12 +96,18 @@ class Discriminator(nn.Module):
         scs.append(self.f_k(h_pl, c))
 
         # negative
+        # ARISE/DGI-style in-batch negative sampling is implemented by cyclically
+        # shifting the summary vectors.  The previous slice ``c_mi[-2:-1, :]``
+        # becomes empty when batch_size == 1, which can happen for datasets such
+        # as twitter when Optuna samples batch_size=256 (4865 % 256 == 1).
+        # ``-1:`` is the correct last-row slice and keeps the batch dimension
+        # valid for every batch size.
         c_mi = c
         for _ in range(self.negsamp_round):
-            c_mi = torch.cat((c_mi[-2:-1,:], c_mi[:-1,:]),0)
+            c_mi = torch.cat((c_mi[-1:, :], c_mi[:-1, :]), dim=0)
             scs.append(self.f_k(h_pl, c_mi))
 
-        logits = torch.cat(tuple(scs))
+        logits = torch.cat(tuple(scs), dim=0)
 
         return logits
 
