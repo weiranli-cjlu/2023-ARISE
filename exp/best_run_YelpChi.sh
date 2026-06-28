@@ -1,0 +1,1 @@
+python run.py --dataset YelpChi --runs 10 --num_epoch 10 --lr 0.00011715937392307068 --weight_decay 0.000352048104552604 --embedding_dim 64 --batch_size 256 --subgraph_size 8 --readout max --auc_test_rounds 64 --negsamp_ratio 3 --rwr_restart_prob 0.35752012633374763 --subgraph_resample_interval 1

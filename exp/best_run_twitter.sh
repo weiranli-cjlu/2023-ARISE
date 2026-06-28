@@ -1,0 +1,1 @@
+python run.py --dataset twitter --runs 10 --num_epoch 200 --lr 0.0046851592759098795 --weight_decay 5.762653542711958e-06 --embedding_dim 256 --batch_size 300 --subgraph_size 4 --readout avg --auc_test_rounds 64 --negsamp_ratio 2 --rwr_restart_prob 0.8641021646122924

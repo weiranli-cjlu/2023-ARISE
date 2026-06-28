@@ -1,0 +1,1 @@
+python run.py --dataset book --runs 10 --num_epoch 100 --lr 0.0001871446726757717 --weight_decay 6.81002726705553e-07 --embedding_dim 64 --batch_size 256 --subgraph_size 3 --readout min --auc_test_rounds 64 --negsamp_ratio 3 --rwr_restart_prob 0.901359450042778

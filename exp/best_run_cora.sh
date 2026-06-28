@@ -1,0 +1,1 @@
+python run.py --dataset cora --runs 10 --num_epoch 100 --lr 0.000601080319508475 --weight_decay 3.066060359941328e-08 --embedding_dim 256 --batch_size 256 --subgraph_size 6 --readout avg --auc_test_rounds 64 --negsamp_ratio 2 --rwr_restart_prob 0.8307724132925114

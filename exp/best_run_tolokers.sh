@@ -1,0 +1,1 @@
+python run.py --dataset tolokers --runs 10 --num_epoch 500 --lr 0.0021771111638928813 --weight_decay 1.2729294223405688e-08 --embedding_dim 128 --batch_size 128 --subgraph_size 3 --readout avg --auc_test_rounds 64 --negsamp_ratio 1 --rwr_restart_prob 0.9492557897961375 --subgraph_resample_interval 1

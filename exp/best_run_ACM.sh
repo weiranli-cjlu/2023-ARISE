@@ -1,0 +1,1 @@
+python run.py --dataset ACM --runs 10 --num_epoch 500 --lr 0.0001304177073254446 --weight_decay 4.112438349028867e-07 --embedding_dim 256 --batch_size 128 --subgraph_size 7 --readout avg --auc_test_rounds 64 --negsamp_ratio 3 --rwr_restart_prob 0.854825153681793

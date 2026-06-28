@@ -3,3 +3,4 @@ __pycache__
 best_model.pt
 optuna_results
 test.ipynb
+results

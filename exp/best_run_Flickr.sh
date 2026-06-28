@@ -1,0 +1,1 @@
+python run.py --dataset Flickr --runs 10 --num_epoch 200 --lr 0.000745439397478521 --weight_decay 5.8208644473693006e-08 --embedding_dim 128 --batch_size 128 --subgraph_size 6 --readout avg --auc_test_rounds 64 --negsamp_ratio 2 --rwr_restart_prob 0.9490747395961849 --subgraph_resample_interval 1

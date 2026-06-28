@@ -1,0 +1,1 @@
+python run.py --dataset BlogCatalog --runs 10 --num_epoch 200 --lr 0.0027837796699944767 --weight_decay 1.0049793632522767e-08 --embedding_dim 128 --batch_size 128 --subgraph_size 6 --readout max --auc_test_rounds 64 --negsamp_ratio 1 --rwr_restart_prob 0.6965715054616234 --subgraph_resample_interval 1
